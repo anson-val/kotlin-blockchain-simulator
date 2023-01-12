@@ -6,23 +6,35 @@ import kotlin.random.Random.Default.nextLong
 import kotlin.system.measureTimeMillis
 
 const val BLOCK_COUNT = 5
-const val NUMBER_OF_MINERS = 20
+const val NUMBER_OF_MINERS = 10
+const val NUMBER_OF_SENDERS = 10
+const val MILLIS_TO_SECOND = 1000.0
+const val MAX_DELAY_MILLIS: Long = 30
+const val PRINT_IMMEDIATELY = false
 
 fun main() {
     Blockchain.initializeChain()
 
     Mine.createMiner(NUMBER_OF_MINERS)
+    Clients.createSender(NUMBER_OF_SENDERS)
     Mine.startAll()
+    Clients.startAll()
+
+    Clients.joinAll()
     Mine.joinAll()
 
     Blockchain.printChain()
 }
 
+class Message(val userName: String, val content: String)
+
 class Block(val id: Long = 1, val hashPrev: String = "0", var hashLeadingZeros: Int = 0, val minerId: Long) {
     private companion object {
-        const val EXTRA_LEADING_ZEROS = 2
+        const val EXTRA_DIGITS = 2
     }
 
+    @Volatile
+    var data = mutableListOf<Message>()
     val timeCreatedAt: Long = System.currentTimeMillis()
     var magicNumber: Long = 0
     var secondsElapsed: Double = 0.0
@@ -34,10 +46,10 @@ class Block(val id: Long = 1, val hashPrev: String = "0", var hashLeadingZeros: 
 
         secondsElapsed = measureTimeMillis {
             do {
-                magicNumber = nextLong(1, 10f.pow(hashLeadingZeros + EXTRA_LEADING_ZEROS).toLong())
+                magicNumber = nextLong(1, 10f.pow(hashLeadingZeros + EXTRA_DIGITS).toLong())
                 hash = applySha256(id.toString() + timeCreatedAt.toString() + hashPrev + magicNumber.toString())
             } while (hash.slice(0 until hashLeadingZeros) != "0".repeat(hashLeadingZeros))
-        } / 1000.0
+        } / MILLIS_TO_SECOND
 
         return hash
     }
@@ -47,19 +59,30 @@ object Blockchain {
     val chain: MutableList<Block> = mutableListOf()
     private const val SECONDS_INCREASE_DIFFICULTY = 15
     private const val SECONDS_DECREASE_DIFFICULTY = 60
+    private val pendingData: MutableList<Message> = mutableListOf()
 
-    private fun addBlock(block: Block) {
-        chain.add(block)
+    @Synchronized
+    fun getMessage(userName: String, content: String) {
+        pendingData.add(Message(userName, content))
+    }
+
+    private fun appendToChain(block: Block) {
         when {
-            chain.last().secondsElapsed < SECONDS_INCREASE_DIFFICULTY -> ++chain.last().nextLeadingZeros
-            chain.last().secondsElapsed >= SECONDS_DECREASE_DIFFICULTY -> --chain.last().nextLeadingZeros
-            else -> chain.last().nextLeadingZeros
+            block.secondsElapsed < SECONDS_INCREASE_DIFFICULTY -> ++block.nextLeadingZeros
+            block.secondsElapsed >= SECONDS_DECREASE_DIFFICULTY -> --block.nextLeadingZeros
+            else -> block.nextLeadingZeros
         }
+        block.data.addAll(pendingData)
+        chain.add(block)
+        if (PRINT_IMMEDIATELY) {
+            printBlock(chain.lastIndex)
+        }
+        pendingData.clear()
     }
 
     fun initializeChain() {
         val threadId = Thread.currentThread().threadId()
-        addBlock(Block(minerId = threadId))
+        appendToChain(Block(minerId = threadId))
     }
 
     fun generateBlock() {
@@ -72,9 +95,9 @@ object Blockchain {
 
             pendingBlock = Block(blockId, hashPrev, chain.last().nextLeadingZeros, threadId)
 
-            synchronized(Blockchain) {
+            synchronized(chain) {
                 if (pendingBlock.hashPrev == chain.last().hashBlock && chain.size < BLOCK_COUNT) {
-                    addBlock(pendingBlock)
+                    appendToChain(pendingBlock)
                 }
             }
         } while (chain.size < BLOCK_COUNT)
@@ -87,22 +110,28 @@ object Blockchain {
             block.nextLeadingZeros < block.hashLeadingZeros -> "N was decreased to ${block.nextLeadingZeros}"
             else -> "N stays the same"
         }
-
+        var dataString = ""
+        if (block.data.isEmpty()) {
+            dataString = "no messages"
+        } else {
+            block.data.forEach { dataString += "\n${it.userName}: ${it.content}" }
+        }
         println(
             """
-            Block:
-            Created by miner # ${block.minerId}
-            Id: ${block.id}
-            Timestamp: ${block.timeCreatedAt}
-            Magic number: ${block.magicNumber}
-            Hash of the previous block:
-            ${block.hashPrev}
-            Hash of the block:
-            ${block.hashBlock}
-            Block was generating for ${block.secondsElapsed} seconds
-            $zerosChange
-            
-            """.trimIndent()
+Block:
+Created by miner # ${block.minerId}
+Id: ${block.id}
+Timestamp: ${block.timeCreatedAt}
+Magic number: ${block.magicNumber}
+Hash of the previous block:
+${block.hashPrev}
+Hash of the block:
+${block.hashBlock}
+Block data: $dataString
+Block was generating for ${block.secondsElapsed} seconds
+$zerosChange
+
+""".trimIndent()
         )
     }
 
@@ -134,6 +163,34 @@ object Mine {
 
     fun joinAll() {
         miners.forEach { it.join() }
+    }
+}
+
+class Sender : Thread() {
+    override fun run() {
+        var messageCount = 1
+        while (Blockchain.chain.size < BLOCK_COUNT) {
+            val content = "You there? ${currentThread().threadId()}, $messageCount"
+            Blockchain.getMessage("Test", content)
+            sleep(nextLong(1, MAX_DELAY_MILLIS))
+            ++messageCount
+        }
+    }
+}
+
+object Clients {
+    private val senders: MutableList<Sender> = mutableListOf()
+
+    fun createSender(count: Int = 1) {
+        repeat(count) { senders.add(Sender()) }
+    }
+
+    fun startAll() {
+        senders.forEach { it.start() }
+    }
+
+    fun joinAll() {
+        senders.forEach { it.join() }
     }
 }
 
